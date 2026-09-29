@@ -108,7 +108,7 @@ func rndUD() {
 }
 
 func getQU() {
-	url := "https://www.goodreads.com"
+	url := "https://www.goodreads.com/quotes"
 
 	var body string
 	if err := fetchData(url, &body); err != nil {
@@ -126,11 +126,19 @@ func getQU() {
 }
 
 func extractQuote(raw string, re *regexp.Regexp) string {
-	q := re.FindStringSubmatch(raw)
+	/*q := re.FindStringSubmatch(raw)
 	if len(q) < 2 {
 		return ""
 	}
-	return q[1]
+	return q[1]*/
+
+	matches := re.FindAllStringSubmatch(raw, -1)
+	l := len(matches)
+	if l == 0 {
+		return ""
+	}
+
+	return matches[rand.IntN(l)][1]
 }
 
 func parseQuoteText(rawHTML string) (string, string) {
