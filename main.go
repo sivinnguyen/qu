@@ -4,16 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"log"
 	"math/rand/v2"
 	"net/http"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
-
-	"github.com/gocolly/colly/v2"
 )
 
 var httpClient *http.Client = &http.Client{
@@ -36,27 +33,26 @@ type Words struct {
 	Data []Word `json:"data"`
 }
 
-type Quote struct {
-	Text   string
-	Author string
-}
-
-func getCacheDir() string {
-	currentDir := "./cache"
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		return currentDir
-	}
-	quCache := filepath.Join(cacheDir, "qu")
-	err = os.MkdirAll(quCache, 0755)
-	if err != nil {
-		return currentDir
-	}
-	return quCache
-}
+var (
+	quoteTextRe     = regexp.MustCompile(`(?s)<div[^>]*class="[^"]*\bquoteText\b[^"]*"[^>]*>(.*?)</div>`)
+	tagRe           = regexp.MustCompile(`<[^>]*>`)
+	wsRe            = regexp.MustCompile(`\s+`)
+	dashRe          = regexp.MustCompile(`\s*[―—–-]+\s*`)
+	leadingQuoteRe  = regexp.MustCompile(`^[\s"“”‘’'«»]+`)
+	trailingQuoteRe = regexp.MustCompile(`[\s"“”‘’'«»]+$`)
+)
 
 func fetchData(url string, data any) error {
-	resp, err := httpClient.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("Request %q: %w", url, err)
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("Fetch %q: %w", url, err)
 	}
@@ -66,7 +62,17 @@ func fetchData(url string, data any) error {
 		return fmt.Errorf("Fetch %q: status %d", url, resp.StatusCode)
 	}
 
-	return json.NewDecoder(resp.Body).Decode(data)
+	switch v := data.(type) {
+	case *string:
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("Read %q body: %w", url, err)
+		}
+		*v = string(bodyBytes)
+		return nil
+	default:
+		return json.NewDecoder(resp.Body).Decode(data)
+	}
 }
 
 func rndHN() {
@@ -101,79 +107,59 @@ func rndUD() {
 	fmt.Println(word)
 }
 
-func rndQU() {
-	var quotes []Quote
-	cacheDir := getCacheDir()
+func getQU() {
+	url := "https://www.goodreads.com"
 
-	c := colly.NewCollector(
-		colly.AllowedDomains("www.goodreads.com", "goodreads.com"),
-		//colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
-		colly.UserAgent("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"),
-		colly.Async(true),
-		colly.CacheDir(cacheDir),
-	)
-
-	c.CacheExpiration = 24 * time.Hour
-
-	/*c.OnRequest(func(r *colly.Request) {
-		fmt.Println("Visiting:", r.URL.String())
-	})*/
-
-	c.OnHTML(".quote", func(e *colly.HTMLElement) {
-		//text := strings.TrimSpace(e.ChildText(".quoteBody"))
-
-		text := formatQuote(e)
-		author := strings.TrimSpace(e.ChildText(".quoteAuthor"))
-
-		if text != "" {
-			quotes = append(quotes, Quote{Text: text, Author: author})
-		}
-	})
-
-	c.OnError(func(r *colly.Response, err error) {
-		log.Printf("Error: status=%d, err=%v", r.StatusCode, err)
-	})
-
-	if err := c.Visit("https://www.goodreads.com/quotes"); err != nil {
+	var body string
+	if err := fetchData(url, &body); err != nil {
 		log.Fatal(err)
 	}
 
-	c.Wait()
-
-	if len(quotes) == 0 {
+	raw := extractQuote(body, quoteTextRe)
+	if raw == "" {
 		log.Fatal("Quote not found")
 	}
 
-	pick := quotes[rand.IntN(len(quotes))]
-	quote := fmt.Sprintf("[Goodreads] %s -- %s", pick.Text, pick.Author)
-	fmt.Println(quote)
+	quote, author := parseQuoteText(raw)
+	text := fmt.Sprintf("[Goodreads] %s -- %s", quote, author)
+	fmt.Println(text)
 }
 
-func formatQuote(e *colly.HTMLElement) string {
-	sep := ". "
-	tags := regexp.MustCompile(`<[^>]*>`)
-	raw, _ := e.DOM.Find("blockquote.quoteBody").Html()
+func extractQuote(raw string, re *regexp.Regexp) string {
+	q := re.FindStringSubmatch(raw)
+	if len(q) < 2 {
+		return ""
+	}
+	return q[1]
+}
 
-	// Replace <br> by separator
-	replacer := strings.NewReplacer(
-		"<br />", sep,
-		"<br/>", sep,
-		"<br>", sep,
-	)
-	raw = replacer.Replace(raw)
-
-	// Strip remain tags
-	text := tags.ReplaceAllString(raw, "")
+func parseQuoteText(rawHTML string) (string, string) {
+	text := tagRe.ReplaceAllString(rawHTML, " ")
 	text = html.UnescapeString(text)
-	text = strings.Join(strings.Fields(text), " ")
+	text = wsRe.ReplaceAllString(text, " ")
 
-	return strings.TrimSpace(text)
+	idx := dashRe.FindStringIndex(text)
+	var quotePart, authorPart string
+
+	if idx != nil {
+		quotePart = text[:idx[0]]
+		authorPart = text[idx[1]:]
+	} else {
+		quotePart = text
+	}
+
+	quotePart = leadingQuoteRe.ReplaceAllString(quotePart, "")
+	quotePart = trailingQuoteRe.ReplaceAllString(quotePart, "")
+	quotePart = strings.TrimSpace(quotePart)
+	authorPart = strings.TrimSpace(authorPart)
+
+	return quotePart, authorPart
 }
 
 func main() {
 	functions := []func(){
 		rndHN,
-		rndQU,
+		getQU,
 		rndUD,
 	}
 
